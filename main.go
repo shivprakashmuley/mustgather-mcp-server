@@ -16,10 +16,12 @@ limitations under the License.
 package main
 
 import (
-	"github.com/gmeghnag/omc/root"
+	//"github.com/gmeghnag/omc/root"
+	"github.com/shivprakashmuley/omc-mcp-server/pkg/omc-mcp-server/cmd"
 )
 
 func main() {
 	//fmt.Println("inside main") // FLOW 3
-	root.RootCmd.Execute()
+	//root.RootCmd.Execute()
+	cmd.Execute()
 }
