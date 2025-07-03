@@ -5,35 +5,33 @@ import (
 	"fmt"
 
 	"github.com/mark3labs/mcp-go/server"
-	omcServer "github.com/shivprakashmuley/omc-mcp-server/mcp/server"
-	"github.com/shivprakashmuley/omc-mcp-server/mcp/version"
+	omcServer "github.com/shivprakashmuley/mustgather-mcp-server/mcp/server"
+	"github.com/shivprakashmuley/mustgather-mcp-server/mcp/version"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"golang.org/x/net/context"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "omc-mcp-server [command] [options]",
-	Short: "OpenshiftMustGatherClient Model Context Protocol (MCP) server",
+	Use:   "mustgather-mcp-server [command] [options]",
+	Short: "OpenShift must-gather Model Context Protocol (MCP) server",
 	Long: `
-OpenshiftMustGatherClient Model Context Protocol (MCP) server
+OpenShift must-gather Model Context Protocol (MCP) server
 
   # show this help
-  omc-mcp-server -h
+  mustgather-mcp-server -h
 
   # shows version information
-  omc-mcp-server --version
+  mustgather-mcp-server --version
 
   # start STDIO server
-  omc-mcp-server
+  mustgather-mcp-server
 
   # start a SSE server on port 8080
-  omc-mcp-server --sse-port 8080
+  mustgather-mcp-server --sse-port 8080
 
-  # start a SSE server on port 8443 with a public HTTPS host of example.com
-  omc-mcp-server --sse-port 8443 --sse-base-url https://example.com:8443
+  mustgather-mcp-server --sse-port 8443 --sse-base-url https://example.com:8443`,
 
-  # TODO: add more examples`,
 	Run: func(cmd *cobra.Command, args []string) {
 		if viper.GetBool("version") {
 			fmt.Println(version.Version)

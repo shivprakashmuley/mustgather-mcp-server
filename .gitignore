@@ -7,4 +7,4 @@ omc-linux-amd64
 omc-win-amd64
 cmd/describe/apps
 .vscode/launch.json
-omc-mcp-server
+mustgather-mcp-server
