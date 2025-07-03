@@ -1,4 +1,4 @@
-module github.com/shivprakashmuley/omc-mcp-server
+module github.com/gmeghnag/omc
 
 go 1.23.0
 
