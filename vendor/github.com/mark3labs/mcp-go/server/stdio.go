@@ -40,7 +40,7 @@ func WithErrorLogger(logger *log.Logger) StdioOption {
 	}
 }
 
-// WithStdioContextFunc sets a function that will be called to customise the context
+// WithContextFunc sets a function that will be called to customise the context
 // to the server. Note that the stdio server uses the same context for all requests,
 // so this function will only be called once per server instance.
 func WithStdioContextFunc(fn StdioContextFunc) StdioOption {
@@ -53,8 +53,6 @@ func WithStdioContextFunc(fn StdioContextFunc) StdioOption {
 type stdioSession struct {
 	notifications chan mcp.JSONRPCNotification
 	initialized   atomic.Bool
-	loggingLevel  atomic.Value
-	clientInfo    atomic.Value // stores session-specific client info
 }
 
 func (s *stdioSession) SessionID() string {
@@ -66,8 +64,6 @@ func (s *stdioSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
 }
 
 func (s *stdioSession) Initialize() {
-	// set default logging level
-	s.loggingLevel.Store(mcp.LoggingLevelError)
 	s.initialized.Store(true)
 }
 
@@ -75,36 +71,7 @@ func (s *stdioSession) Initialized() bool {
 	return s.initialized.Load()
 }
 
-func (s *stdioSession) GetClientInfo() mcp.Implementation {
-	if value := s.clientInfo.Load(); value != nil {
-		if clientInfo, ok := value.(mcp.Implementation); ok {
-			return clientInfo
-		}
-	}
-	return mcp.Implementation{}
-}
-
-func (s *stdioSession) SetClientInfo(clientInfo mcp.Implementation) {
-	s.clientInfo.Store(clientInfo)
-}
-
-func (s *stdioSession) SetLogLevel(level mcp.LoggingLevel) {
-	s.loggingLevel.Store(level)
-}
-
-func (s *stdioSession) GetLogLevel() mcp.LoggingLevel {
-	level := s.loggingLevel.Load()
-	if level == nil {
-		return mcp.LoggingLevelError
-	}
-	return level.(mcp.LoggingLevel)
-}
-
-var (
-	_ ClientSession         = (*stdioSession)(nil)
-	_ SessionWithLogging    = (*stdioSession)(nil)
-	_ SessionWithClientInfo = (*stdioSession)(nil)
-)
+var _ ClientSession = (*stdioSession)(nil)
 
 var stdioSessionInstance = stdioSession{
 	notifications: make(chan mcp.JSONRPCNotification, 100),
@@ -136,79 +103,6 @@ func (s *StdioServer) SetContextFunc(fn StdioContextFunc) {
 	s.contextFunc = fn
 }
 
-// handleNotifications continuously processes notifications from the session's notification channel
-// and writes them to the provided output. It runs until the context is cancelled.
-// Any errors encountered while writing notifications are logged but do not stop the handler.
-func (s *StdioServer) handleNotifications(ctx context.Context, stdout io.Writer) {
-	for {
-		select {
-		case notification := <-stdioSessionInstance.notifications:
-			if err := s.writeResponse(notification, stdout); err != nil {
-				s.errLogger.Printf("Error writing notification: %v", err)
-			}
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// processInputStream continuously reads and processes messages from the input stream.
-// It handles EOF gracefully as a normal termination condition.
-// The function returns when either:
-// - The context is cancelled (returns context.Err())
-// - EOF is encountered (returns nil)
-// - An error occurs while reading or processing messages (returns the error)
-func (s *StdioServer) processInputStream(ctx context.Context, reader *bufio.Reader, stdout io.Writer) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		line, err := s.readNextLine(ctx, reader)
-		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			s.errLogger.Printf("Error reading input: %v", err)
-			return err
-		}
-
-		if err := s.processMessage(ctx, line, stdout); err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			s.errLogger.Printf("Error handling message: %v", err)
-			return err
-		}
-	}
-}
-
-// readNextLine reads a single line from the input reader in a context-aware manner.
-// It uses channels to make the read operation cancellable via context.
-// Returns the read line and any error encountered. If the context is cancelled,
-// returns an empty string and the context's error. EOF is returned when the input
-// stream is closed.
-func (s *StdioServer) readNextLine(ctx context.Context, reader *bufio.Reader) (string, error) {
-	type result struct {
-		line string
-		err  error
-	}
-
-	resultCh := make(chan result, 1)
-
-	go func() {
-		line, err := reader.ReadString('\n')
-		resultCh <- result{line: line, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return "", nil
-	case res := <-resultCh:
-		return res.line, res.err
-	}
-}
-
 // Listen starts listening for JSON-RPC messages on the provided input and writes responses to the provided output.
 // It runs until the context is cancelled or an error occurs.
 // Returns an error if there are issues with reading input or writing output.
@@ -218,10 +112,10 @@ func (s *StdioServer) Listen(
 	stdout io.Writer,
 ) error {
 	// Set a static client context since stdio only has one client
-	if err := s.server.RegisterSession(ctx, &stdioSessionInstance); err != nil {
+	if err := s.server.RegisterSession(&stdioSessionInstance); err != nil {
 		return fmt.Errorf("register session: %w", err)
 	}
-	defer s.server.UnregisterSession(ctx, stdioSessionInstance.SessionID())
+	defer s.server.UnregisterSession(stdioSessionInstance.SessionID())
 	ctx = s.server.WithContext(ctx, &stdioSessionInstance)
 
 	// Add in any custom context.
@@ -232,8 +126,64 @@ func (s *StdioServer) Listen(
 	reader := bufio.NewReader(stdin)
 
 	// Start notification handler
-	go s.handleNotifications(ctx, stdout)
-	return s.processInputStream(ctx, reader, stdout)
+	go func() {
+		for {
+			select {
+			case notification := <-stdioSessionInstance.notifications:
+				err := s.writeResponse(
+					notification,
+					stdout,
+				)
+				if err != nil {
+					s.errLogger.Printf(
+						"Error writing notification: %v",
+						err,
+					)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			// Use a goroutine to make the read cancellable
+			readChan := make(chan string, 1)
+			errChan := make(chan error, 1)
+
+			go func() {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					errChan <- err
+					return
+				}
+				readChan <- line
+			}()
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case err := <-errChan:
+				if err == io.EOF {
+					return nil
+				}
+				s.errLogger.Printf("Error reading input: %v", err)
+				return err
+			case line := <-readChan:
+				if err := s.processMessage(ctx, line, stdout); err != nil {
+					if err == io.EOF {
+						return nil
+					}
+					s.errLogger.Printf("Error handling message: %v", err)
+					return err
+				}
+			}
+		}
+	}
 }
 
 // processMessage handles a single JSON-RPC message and writes the response.
@@ -244,11 +194,6 @@ func (s *StdioServer) processMessage(
 	line string,
 	writer io.Writer,
 ) error {
-	// If line is empty, likely due to ctx cancellation
-	if len(line) == 0 {
-		return nil
-	}
-
 	// Parse the message as raw JSON
 	var rawMessage json.RawMessage
 	if err := json.Unmarshal([]byte(line), &rawMessage); err != nil {
@@ -293,6 +238,7 @@ func (s *StdioServer) writeResponse(
 // Returns an error if the server encounters any issues during operation.
 func ServeStdio(server *MCPServer, opts ...StdioOption) error {
 	s := NewStdioServer(server)
+	s.SetErrorLogger(log.New(os.Stderr, "", log.LstdFlags))
 
 	for _, opt := range opts {
 		opt(s)

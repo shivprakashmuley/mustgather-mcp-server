@@ -7,7 +7,7 @@ toolchain go1.23.3
 replace github.com/gmeghnag/omc => ./omc-cli
 
 require (
-	github.com/mark3labs/mcp-go v0.32.0
+	github.com/mark3labs/mcp-go v0.17.0
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.20.1
 	golang.org/x/net v0.41.0

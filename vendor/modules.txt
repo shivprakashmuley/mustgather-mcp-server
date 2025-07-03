@@ -12,11 +12,10 @@ github.com/google/uuid
 # github.com/inconshreveable/mousetrap v1.1.0
 ## explicit; go 1.18
 github.com/inconshreveable/mousetrap
-# github.com/mark3labs/mcp-go v0.32.0
+# github.com/mark3labs/mcp-go v0.17.0
 ## explicit; go 1.23
 github.com/mark3labs/mcp-go/mcp
 github.com/mark3labs/mcp-go/server
-github.com/mark3labs/mcp-go/util
 # github.com/pelletier/go-toml/v2 v2.2.3
 ## explicit; go 1.21.0
 github.com/pelletier/go-toml/v2

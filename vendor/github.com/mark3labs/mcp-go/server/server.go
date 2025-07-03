@@ -1,12 +1,11 @@
-// Package server provides MCP (Model Context Protocol) server implementations.
+// Package server provides MCP (Model Control Protocol) server implementations.
 package server
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"sync"
 
@@ -40,62 +39,56 @@ type PromptHandlerFunc func(ctx context.Context, request mcp.GetPromptRequest) (
 // ToolHandlerFunc handles tool calls with given arguments.
 type ToolHandlerFunc func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error)
 
-// ToolHandlerMiddleware is a middleware function that wraps a ToolHandlerFunc.
-type ToolHandlerMiddleware func(ToolHandlerFunc) ToolHandlerFunc
-
-// ToolFilterFunc is a function that filters tools based on context, typically using session information.
-type ToolFilterFunc func(ctx context.Context, tools []mcp.Tool) []mcp.Tool
-
 // ServerTool combines a Tool with its ToolHandlerFunc.
 type ServerTool struct {
 	Tool    mcp.Tool
 	Handler ToolHandlerFunc
 }
 
-// ServerPrompt combines a Prompt with its handler function.
-type ServerPrompt struct {
-	Prompt  mcp.Prompt
-	Handler PromptHandlerFunc
+// ClientSession represents an active session that can be used by MCPServer to interact with client.
+type ClientSession interface {
+	// Initialize marks session as fully initialized and ready for notifications
+	Initialize()
+	// Initialized returns if session is ready to accept notifications
+	Initialized() bool
+	// NotificationChannel provides a channel suitable for sending notifications to client.
+	NotificationChannel() chan<- mcp.JSONRPCNotification
+	// SessionID is a unique identifier used to track user session.
+	SessionID() string
 }
 
-// ServerResource combines a Resource with its handler function.
-type ServerResource struct {
-	Resource mcp.Resource
-	Handler  ResourceHandlerFunc
-}
+// clientSessionKey is the context key for storing current client notification channel.
+type clientSessionKey struct{}
 
-// serverKey is the context key for storing the server instance
-type serverKey struct{}
-
-// ServerFromContext retrieves the MCPServer instance from a context
-func ServerFromContext(ctx context.Context) *MCPServer {
-	if srv, ok := ctx.Value(serverKey{}).(*MCPServer); ok {
-		return srv
+// ClientSessionFromContext retrieves current client notification context from context.
+func ClientSessionFromContext(ctx context.Context) ClientSession {
+	if session, ok := ctx.Value(clientSessionKey{}).(ClientSession); ok {
+		return session
 	}
 	return nil
 }
 
-// UnparsableMessageError is attached to the RequestError when json.Unmarshal
+// UnparseableMessageError is attached to the RequestError when json.Unmarshal
 // fails on the request.
-type UnparsableMessageError struct {
+type UnparseableMessageError struct {
 	message json.RawMessage
 	method  mcp.MCPMethod
 	err     error
 }
 
-func (e *UnparsableMessageError) Error() string {
-	return fmt.Sprintf("unparsable %s request: %s", e.method, e.err)
+func (e *UnparseableMessageError) Error() string {
+	return fmt.Sprintf("unparseable %s request: %s", e.method, e.err)
 }
 
-func (e *UnparsableMessageError) Unwrap() error {
+func (e *UnparseableMessageError) Unwrap() error {
 	return e.err
 }
 
-func (e *UnparsableMessageError) GetMessage() json.RawMessage {
+func (e *UnparseableMessageError) GetMessage() json.RawMessage {
 	return e.message
 }
 
-func (e *UnparsableMessageError) GetMethod() mcp.MCPMethod {
+func (e *UnparseableMessageError) GetMethod() mcp.MCPMethod {
 	return e.method
 }
 
@@ -114,7 +107,7 @@ func (e *requestError) Error() string {
 func (e *requestError) ToJSONRPCError() mcp.JSONRPCError {
 	return mcp.JSONRPCError{
 		JSONRPC: mcp.JSONRPC_VERSION,
-		ID:      mcp.NewRequestId(e.id),
+		ID:      e.id,
 		Error: struct {
 			Code    int    `json:"code"`
 			Message string `json:"message"`
@@ -130,42 +123,124 @@ func (e *requestError) Unwrap() error {
 	return e.err
 }
 
+var (
+	ErrUnsupported      = errors.New("not supported")
+	ErrResourceNotFound = errors.New("resource not found")
+	ErrPromptNotFound   = errors.New("prompt not found")
+	ErrToolNotFound     = errors.New("tool not found")
+)
+
 // NotificationHandlerFunc handles incoming notifications.
 type NotificationHandlerFunc func(ctx context.Context, notification mcp.JSONRPCNotification)
 
-// MCPServer implements a Model Context Protocol server that can handle various types of requests
+// MCPServer implements a Model Control Protocol server that can handle various types of requests
 // including resources, prompts, and tools.
 type MCPServer struct {
-	// Separate mutexes for different resource types
-	resourcesMu            sync.RWMutex
-	promptsMu              sync.RWMutex
-	toolsMu                sync.RWMutex
-	middlewareMu           sync.RWMutex
-	notificationHandlersMu sync.RWMutex
-	capabilitiesMu         sync.RWMutex
-	toolFiltersMu          sync.RWMutex
-
-	name                   string
-	version                string
-	instructions           string
-	resources              map[string]resourceEntry
-	resourceTemplates      map[string]resourceTemplateEntry
-	prompts                map[string]mcp.Prompt
-	promptHandlers         map[string]PromptHandlerFunc
-	tools                  map[string]ServerTool
-	toolHandlerMiddlewares []ToolHandlerMiddleware
-	toolFilters            []ToolFilterFunc
-	notificationHandlers   map[string]NotificationHandlerFunc
-	capabilities           serverCapabilities
-	paginationLimit        *int
-	sessions               sync.Map
-	hooks                  *Hooks
+	mu                   sync.RWMutex // Add mutex for protecting shared resources
+	name                 string
+	version              string
+	instructions         string
+	resources            map[string]resourceEntry
+	resourceTemplates    map[string]resourceTemplateEntry
+	prompts              map[string]mcp.Prompt
+	promptHandlers       map[string]PromptHandlerFunc
+	tools                map[string]ServerTool
+	notificationHandlers map[string]NotificationHandlerFunc
+	capabilities         serverCapabilities
+	sessions             sync.Map
+	hooks                *Hooks
 }
 
-// WithPaginationLimit sets the pagination limit for the server.
-func WithPaginationLimit(limit int) ServerOption {
-	return func(s *MCPServer) {
-		s.paginationLimit = &limit
+// serverKey is the context key for storing the server instance
+type serverKey struct{}
+
+// ServerFromContext retrieves the MCPServer instance from a context
+func ServerFromContext(ctx context.Context) *MCPServer {
+	if srv, ok := ctx.Value(serverKey{}).(*MCPServer); ok {
+		return srv
+	}
+	return nil
+}
+
+// WithContext sets the current client session and returns the provided context
+func (s *MCPServer) WithContext(
+	ctx context.Context,
+	session ClientSession,
+) context.Context {
+	return context.WithValue(ctx, clientSessionKey{}, session)
+}
+
+// RegisterSession saves session that should be notified in case if some server attributes changed.
+func (s *MCPServer) RegisterSession(
+	session ClientSession,
+) error {
+	sessionID := session.SessionID()
+	if _, exists := s.sessions.LoadOrStore(sessionID, session); exists {
+		return fmt.Errorf("session %s is already registered", sessionID)
+	}
+	return nil
+}
+
+// UnregisterSession removes from storage session that is shut down.
+func (s *MCPServer) UnregisterSession(
+	sessionID string,
+) {
+	s.sessions.Delete(sessionID)
+}
+
+// sendNotificationToAllClients sends a notification to all the currently active clients.
+func (s *MCPServer) sendNotificationToAllClients(
+	method string,
+	params map[string]any,
+) {
+	notification := mcp.JSONRPCNotification{
+		JSONRPC: mcp.JSONRPC_VERSION,
+		Notification: mcp.Notification{
+			Method: method,
+			Params: mcp.NotificationParams{
+				AdditionalFields: params,
+			},
+		},
+	}
+
+	s.sessions.Range(func(k, v any) bool {
+		if session, ok := v.(ClientSession); ok && session.Initialized() {
+			select {
+			case session.NotificationChannel() <- notification:
+			default:
+				// TODO: log blocked channel in the future versions
+			}
+		}
+		return true
+	})
+}
+
+// SendNotificationToClient sends a notification to the current client
+func (s *MCPServer) SendNotificationToClient(
+	ctx context.Context,
+	method string,
+	params map[string]any,
+) error {
+	session := ClientSessionFromContext(ctx)
+	if session == nil || !session.Initialized() {
+		return fmt.Errorf("notification channel not initialized")
+	}
+
+	notification := mcp.JSONRPCNotification{
+		JSONRPC: mcp.JSONRPC_VERSION,
+		Notification: mcp.Notification{
+			Method: method,
+			Params: mcp.NotificationParams{
+				AdditionalFields: params,
+			},
+		},
+	}
+
+	select {
+	case session.NotificationChannel() <- notification:
+		return nil
+	default:
+		return fmt.Errorf("notification channel full or blocked")
 	}
 }
 
@@ -174,7 +249,7 @@ type serverCapabilities struct {
 	tools     *toolCapabilities
 	resources *resourceCapabilities
 	prompts   *promptCapabilities
-	logging   *bool
+	logging   bool
 }
 
 // resourceCapabilities defines the supported resource-related features
@@ -202,47 +277,6 @@ func WithResourceCapabilities(subscribe, listChanged bool) ServerOption {
 			listChanged: listChanged,
 		}
 	}
-}
-
-// WithToolHandlerMiddleware allows adding a middleware for the
-// tool handler call chain.
-func WithToolHandlerMiddleware(
-	toolHandlerMiddleware ToolHandlerMiddleware,
-) ServerOption {
-	return func(s *MCPServer) {
-		s.middlewareMu.Lock()
-		s.toolHandlerMiddlewares = append(s.toolHandlerMiddlewares, toolHandlerMiddleware)
-		s.middlewareMu.Unlock()
-	}
-}
-
-// WithToolFilter adds a filter function that will be applied to tools before they are returned in list_tools
-func WithToolFilter(
-	toolFilter ToolFilterFunc,
-) ServerOption {
-	return func(s *MCPServer) {
-		s.toolFiltersMu.Lock()
-		s.toolFilters = append(s.toolFilters, toolFilter)
-		s.toolFiltersMu.Unlock()
-	}
-}
-
-// WithRecovery adds a middleware that recovers from panics in tool handlers.
-func WithRecovery() ServerOption {
-	return WithToolHandlerMiddleware(func(next ToolHandlerFunc) ToolHandlerFunc {
-		return func(ctx context.Context, request mcp.CallToolRequest) (result *mcp.CallToolResult, err error) {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf(
-						"panic recovered in %s tool handler: %v",
-						request.Params.Name,
-						r,
-					)
-				}
-			}()
-			return next(ctx, request)
-		}
-	})
 }
 
 // WithHooks allows adding hooks that will be called before or after
@@ -277,7 +311,7 @@ func WithToolCapabilities(listChanged bool) ServerOption {
 // WithLogging enables logging capabilities for the server
 func WithLogging() ServerOption {
 	return func(s *MCPServer) {
-		s.capabilities.logging = mcp.ToBoolPtr(true)
+		s.capabilities.logging = true
 	}
 }
 
@@ -306,7 +340,7 @@ func NewMCPServer(
 			tools:     nil,
 			resources: nil,
 			prompts:   nil,
-			logging:   nil,
+			logging:   false,
 		},
 	}
 
@@ -317,46 +351,19 @@ func NewMCPServer(
 	return s
 }
 
-// AddResources registers multiple resources at once
-func (s *MCPServer) AddResources(resources ...ServerResource) {
-	s.implicitlyRegisterResourceCapabilities()
-
-	s.resourcesMu.Lock()
-	for _, entry := range resources {
-		s.resources[entry.Resource.URI] = resourceEntry{
-			resource: entry.Resource,
-			handler:  entry.Handler,
-		}
-	}
-	s.resourcesMu.Unlock()
-
-	// When the list of available resources changes, servers that declared the listChanged capability SHOULD send a notification
-	if s.capabilities.resources.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationResourcesListChanged, nil)
-	}
-}
-
 // AddResource registers a new resource and its handler
 func (s *MCPServer) AddResource(
 	resource mcp.Resource,
 	handler ResourceHandlerFunc,
 ) {
-	s.AddResources(ServerResource{Resource: resource, Handler: handler})
-}
-
-// RemoveResource removes a resource from the server
-func (s *MCPServer) RemoveResource(uri string) {
-	s.resourcesMu.Lock()
-	_, exists := s.resources[uri]
-	if exists {
-		delete(s.resources, uri)
+	if s.capabilities.resources == nil {
+		s.capabilities.resources = &resourceCapabilities{}
 	}
-	s.resourcesMu.Unlock()
-
-	// Send notification to all initialized sessions if listChanged capability is enabled and we actually remove a resource
-	if exists && s.capabilities.resources != nil && s.capabilities.resources.listChanged {
-		s.SendNotificationToAllClients(mcp.MethodNotificationResourcesListChanged, nil)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resources[resource.URI] = resourceEntry{
+		resource: resource,
+		handler:  handler,
 	}
 }
 
@@ -365,63 +372,26 @@ func (s *MCPServer) AddResourceTemplate(
 	template mcp.ResourceTemplate,
 	handler ResourceTemplateHandlerFunc,
 ) {
-	s.implicitlyRegisterResourceCapabilities()
-
-	s.resourcesMu.Lock()
+	if s.capabilities.resources == nil {
+		s.capabilities.resources = &resourceCapabilities{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.resourceTemplates[template.URITemplate.Raw()] = resourceTemplateEntry{
 		template: template,
 		handler:  handler,
-	}
-	s.resourcesMu.Unlock()
-
-	// When the list of available resources changes, servers that declared the listChanged capability SHOULD send a notification
-	if s.capabilities.resources.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationResourcesListChanged, nil)
-	}
-}
-
-// AddPrompts registers multiple prompts at once
-func (s *MCPServer) AddPrompts(prompts ...ServerPrompt) {
-	s.implicitlyRegisterPromptCapabilities()
-
-	s.promptsMu.Lock()
-	for _, entry := range prompts {
-		s.prompts[entry.Prompt.Name] = entry.Prompt
-		s.promptHandlers[entry.Prompt.Name] = entry.Handler
-	}
-	s.promptsMu.Unlock()
-
-	// When the list of available prompts changes, servers that declared the listChanged capability SHOULD send a notification.
-	if s.capabilities.prompts.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationPromptsListChanged, nil)
 	}
 }
 
 // AddPrompt registers a new prompt handler with the given name
 func (s *MCPServer) AddPrompt(prompt mcp.Prompt, handler PromptHandlerFunc) {
-	s.AddPrompts(ServerPrompt{Prompt: prompt, Handler: handler})
-}
-
-// DeletePrompts removes prompts from the server
-func (s *MCPServer) DeletePrompts(names ...string) {
-	s.promptsMu.Lock()
-	var exists bool
-	for _, name := range names {
-		if _, ok := s.prompts[name]; ok {
-			delete(s.prompts, name)
-			delete(s.promptHandlers, name)
-			exists = true
-		}
+	if s.capabilities.prompts == nil {
+		s.capabilities.prompts = &promptCapabilities{}
 	}
-	s.promptsMu.Unlock()
-
-	// Send notification to all initialized sessions if listChanged capability is enabled, and we actually remove a prompt
-	if exists && s.capabilities.prompts != nil && s.capabilities.prompts.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationPromptsListChanged, nil)
-	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prompts[prompt.Name] = prompt
+	s.promptHandlers[prompt.Name] = handler
 }
 
 // AddTool registers a new tool and its handler
@@ -429,87 +399,39 @@ func (s *MCPServer) AddTool(tool mcp.Tool, handler ToolHandlerFunc) {
 	s.AddTools(ServerTool{Tool: tool, Handler: handler})
 }
 
-// Register tool capabilities due to a tool being added.  Default to
-// listChanged: true, but don't change the value if we've already explicitly
-// registered tools.listChanged false.
-func (s *MCPServer) implicitlyRegisterToolCapabilities() {
-	s.implicitlyRegisterCapabilities(
-		func() bool { return s.capabilities.tools != nil },
-		func() { s.capabilities.tools = &toolCapabilities{listChanged: true} },
-	)
-}
-
-func (s *MCPServer) implicitlyRegisterResourceCapabilities() {
-	s.implicitlyRegisterCapabilities(
-		func() bool { return s.capabilities.resources != nil },
-		func() { s.capabilities.resources = &resourceCapabilities{} },
-	)
-}
-
-func (s *MCPServer) implicitlyRegisterPromptCapabilities() {
-	s.implicitlyRegisterCapabilities(
-		func() bool { return s.capabilities.prompts != nil },
-		func() { s.capabilities.prompts = &promptCapabilities{} },
-	)
-}
-
-func (s *MCPServer) implicitlyRegisterCapabilities(check func() bool, register func()) {
-	s.capabilitiesMu.RLock()
-	if check() {
-		s.capabilitiesMu.RUnlock()
-		return
-	}
-	s.capabilitiesMu.RUnlock()
-
-	s.capabilitiesMu.Lock()
-	if !check() {
-		register()
-	}
-	s.capabilitiesMu.Unlock()
-}
-
 // AddTools registers multiple tools at once
 func (s *MCPServer) AddTools(tools ...ServerTool) {
-	s.implicitlyRegisterToolCapabilities()
-
-	s.toolsMu.Lock()
+	if s.capabilities.tools == nil {
+		s.capabilities.tools = &toolCapabilities{}
+	}
+	s.mu.Lock()
 	for _, entry := range tools {
 		s.tools[entry.Tool.Name] = entry
 	}
-	s.toolsMu.Unlock()
+	s.mu.Unlock()
 
-	// When the list of available tools changes, servers that declared the listChanged capability SHOULD send a notification.
-	if s.capabilities.tools.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationToolsListChanged, nil)
-	}
+	// Send notification to all initialized sessions
+	s.sendNotificationToAllClients("notifications/tools/list_changed", nil)
 }
 
 // SetTools replaces all existing tools with the provided list
 func (s *MCPServer) SetTools(tools ...ServerTool) {
-	s.toolsMu.Lock()
-	s.tools = make(map[string]ServerTool, len(tools))
-	s.toolsMu.Unlock()
+	s.mu.Lock()
+	s.tools = make(map[string]ServerTool)
+	s.mu.Unlock()
 	s.AddTools(tools...)
 }
 
-// DeleteTools removes tools from the server
+// DeleteTools removes a tool from the server
 func (s *MCPServer) DeleteTools(names ...string) {
-	s.toolsMu.Lock()
-	var exists bool
+	s.mu.Lock()
 	for _, name := range names {
-		if _, ok := s.tools[name]; ok {
-			delete(s.tools, name)
-			exists = true
-		}
+		delete(s.tools, name)
 	}
-	s.toolsMu.Unlock()
+	s.mu.Unlock()
 
-	// When the list of available tools changes, servers that declared the listChanged capability SHOULD send a notification.
-	if exists && s.capabilities.tools != nil && s.capabilities.tools.listChanged {
-		// Send notification to all initialized sessions
-		s.SendNotificationToAllClients(mcp.MethodNotificationToolsListChanged, nil)
-	}
+	// Send notification to all initialized sessions
+	s.sendNotificationToAllClients("notifications/tools/list_changed", nil)
 }
 
 // AddNotificationHandler registers a new handler for incoming notifications
@@ -517,14 +439,14 @@ func (s *MCPServer) AddNotificationHandler(
 	method string,
 	handler NotificationHandlerFunc,
 ) {
-	s.notificationHandlersMu.Lock()
-	defer s.notificationHandlersMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.notificationHandlers[method] = handler
 }
 
 func (s *MCPServer) handleInitialize(
 	ctx context.Context,
-	_ any,
+	id interface{},
 	request mcp.InitializeRequest,
 ) (*mcp.InitializeResult, *requestError) {
 	capabilities := mcp.ServerCapabilities{}
@@ -558,12 +480,12 @@ func (s *MCPServer) handleInitialize(
 		}
 	}
 
-	if s.capabilities.logging != nil && *s.capabilities.logging {
+	if s.capabilities.logging {
 		capabilities.Logging = &struct{}{}
 	}
 
 	result := mcp.InitializeResult{
-		ProtocolVersion: s.protocolVersion(request.Params.ProtocolVersion),
+		ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
 		ServerInfo: mcp.Implementation{
 			Name:    s.name,
 			Version: s.version,
@@ -574,194 +496,70 @@ func (s *MCPServer) handleInitialize(
 
 	if session := ClientSessionFromContext(ctx); session != nil {
 		session.Initialize()
-
-		// Store client info if the session supports it
-		if sessionWithClientInfo, ok := session.(SessionWithClientInfo); ok {
-			sessionWithClientInfo.SetClientInfo(request.Params.ClientInfo)
-		}
 	}
 	return &result, nil
 }
 
-func (s *MCPServer) protocolVersion(clientVersion string) string {
-	if slices.Contains(mcp.ValidProtocolVersions, clientVersion) {
-		return clientVersion
-	}
-
-	return mcp.LATEST_PROTOCOL_VERSION
-}
-
 func (s *MCPServer) handlePing(
-	_ context.Context,
-	_ any,
-	_ mcp.PingRequest,
-) (*mcp.EmptyResult, *requestError) {
-	return &mcp.EmptyResult{}, nil
-}
-
-func (s *MCPServer) handleSetLevel(
 	ctx context.Context,
-	id any,
-	request mcp.SetLevelRequest,
+	id interface{},
+	request mcp.PingRequest,
 ) (*mcp.EmptyResult, *requestError) {
-	clientSession := ClientSessionFromContext(ctx)
-	if clientSession == nil || !clientSession.Initialized() {
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INTERNAL_ERROR,
-			err:  ErrSessionNotInitialized,
-		}
-	}
-
-	sessionLogging, ok := clientSession.(SessionWithLogging)
-	if !ok {
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INTERNAL_ERROR,
-			err:  ErrSessionDoesNotSupportLogging,
-		}
-	}
-
-	level := request.Params.Level
-	// Validate logging level
-	switch level {
-	case mcp.LoggingLevelDebug, mcp.LoggingLevelInfo, mcp.LoggingLevelNotice,
-		mcp.LoggingLevelWarning, mcp.LoggingLevelError, mcp.LoggingLevelCritical,
-		mcp.LoggingLevelAlert, mcp.LoggingLevelEmergency:
-		// Valid level
-	default:
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INVALID_PARAMS,
-			err:  fmt.Errorf("invalid logging level '%s'", level),
-		}
-	}
-
-	sessionLogging.SetLogLevel(level)
-
 	return &mcp.EmptyResult{}, nil
-}
-
-func listByPagination[T mcp.Named](
-	_ context.Context,
-	s *MCPServer,
-	cursor mcp.Cursor,
-	allElements []T,
-) ([]T, mcp.Cursor, error) {
-	startPos := 0
-	if cursor != "" {
-		c, err := base64.StdEncoding.DecodeString(string(cursor))
-		if err != nil {
-			return nil, "", err
-		}
-		cString := string(c)
-		startPos = sort.Search(len(allElements), func(i int) bool {
-			return allElements[i].GetName() > cString
-		})
-	}
-	endPos := len(allElements)
-	if s.paginationLimit != nil {
-		if len(allElements) > startPos+*s.paginationLimit {
-			endPos = startPos + *s.paginationLimit
-		}
-	}
-	elementsToReturn := allElements[startPos:endPos]
-	// set the next cursor
-	nextCursor := func() mcp.Cursor {
-		if s.paginationLimit != nil && len(elementsToReturn) >= *s.paginationLimit {
-			nc := elementsToReturn[len(elementsToReturn)-1].GetName()
-			toString := base64.StdEncoding.EncodeToString([]byte(nc))
-			return mcp.Cursor(toString)
-		}
-		return ""
-	}()
-	return elementsToReturn, nextCursor, nil
 }
 
 func (s *MCPServer) handleListResources(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.ListResourcesRequest,
 ) (*mcp.ListResourcesResult, *requestError) {
-	s.resourcesMu.RLock()
+	s.mu.RLock()
 	resources := make([]mcp.Resource, 0, len(s.resources))
 	for _, entry := range s.resources {
 		resources = append(resources, entry.resource)
 	}
-	s.resourcesMu.RUnlock()
+	s.mu.RUnlock()
 
-	// Sort the resources by name
-	sort.Slice(resources, func(i, j int) bool {
-		return resources[i].Name < resources[j].Name
-	})
-	resourcesToReturn, nextCursor, err := listByPagination(
-		ctx,
-		s,
-		request.Params.Cursor,
-		resources,
-	)
-	if err != nil {
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INVALID_PARAMS,
-			err:  err,
-		}
-	}
 	result := mcp.ListResourcesResult{
-		Resources: resourcesToReturn,
-		PaginatedResult: mcp.PaginatedResult{
-			NextCursor: nextCursor,
-		},
+		Resources: resources,
+	}
+	if request.Params.Cursor != "" {
+		result.NextCursor = "" // Handle pagination if needed
 	}
 	return &result, nil
 }
 
 func (s *MCPServer) handleListResourceTemplates(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.ListResourceTemplatesRequest,
 ) (*mcp.ListResourceTemplatesResult, *requestError) {
-	s.resourcesMu.RLock()
+	s.mu.RLock()
 	templates := make([]mcp.ResourceTemplate, 0, len(s.resourceTemplates))
 	for _, entry := range s.resourceTemplates {
 		templates = append(templates, entry.template)
 	}
-	s.resourcesMu.RUnlock()
-	sort.Slice(templates, func(i, j int) bool {
-		return templates[i].Name < templates[j].Name
-	})
-	templatesToReturn, nextCursor, err := listByPagination(
-		ctx,
-		s,
-		request.Params.Cursor,
-		templates,
-	)
-	if err != nil {
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INVALID_PARAMS,
-			err:  err,
-		}
-	}
+	s.mu.RUnlock()
+
 	result := mcp.ListResourceTemplatesResult{
-		ResourceTemplates: templatesToReturn,
-		PaginatedResult: mcp.PaginatedResult{
-			NextCursor: nextCursor,
-		},
+		ResourceTemplates: templates,
+	}
+	if request.Params.Cursor != "" {
+		result.NextCursor = "" // Handle pagination if needed
 	}
 	return &result, nil
 }
 
 func (s *MCPServer) handleReadResource(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.ReadResourceRequest,
 ) (*mcp.ReadResourceResult, *requestError) {
-	s.resourcesMu.RLock()
+	s.mu.RLock()
 	// First try direct resource handlers
 	if entry, ok := s.resources[request.Params.URI]; ok {
 		handler := entry.handler
-		s.resourcesMu.RUnlock()
+		s.mu.RUnlock()
 		contents, err := handler(ctx, request)
 		if err != nil {
 			return nil, &requestError{
@@ -783,14 +581,14 @@ func (s *MCPServer) handleReadResource(
 			matched = true
 			matchedVars := template.URITemplate.Match(request.Params.URI)
 			// Convert matched variables to a map
-			request.Params.Arguments = make(map[string]any, len(matchedVars))
+			request.Params.Arguments = make(map[string]interface{})
 			for name, value := range matchedVars {
 				request.Params.Arguments[name] = value.V
 			}
 			break
 		}
 	}
-	s.resourcesMu.RUnlock()
+	s.mu.RUnlock()
 
 	if matched {
 		contents, err := matchedHandler(ctx, request)
@@ -806,12 +604,8 @@ func (s *MCPServer) handleReadResource(
 
 	return nil, &requestError{
 		id:   id,
-		code: mcp.RESOURCE_NOT_FOUND,
-		err: fmt.Errorf(
-			"handler not found for resource URI '%s': %w",
-			request.Params.URI,
-			ErrResourceNotFound,
-		),
+		code: mcp.INVALID_PARAMS,
+		err:  fmt.Errorf("handler not found for resource URI '%s': %w", request.Params.URI, ErrResourceNotFound),
 	}
 }
 
@@ -822,50 +616,33 @@ func matchesTemplate(uri string, template *mcp.URITemplate) bool {
 
 func (s *MCPServer) handleListPrompts(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.ListPromptsRequest,
 ) (*mcp.ListPromptsResult, *requestError) {
-	s.promptsMu.RLock()
+	s.mu.RLock()
 	prompts := make([]mcp.Prompt, 0, len(s.prompts))
 	for _, prompt := range s.prompts {
 		prompts = append(prompts, prompt)
 	}
-	s.promptsMu.RUnlock()
+	s.mu.RUnlock()
 
-	// sort prompts by name
-	sort.Slice(prompts, func(i, j int) bool {
-		return prompts[i].Name < prompts[j].Name
-	})
-	promptsToReturn, nextCursor, err := listByPagination(
-		ctx,
-		s,
-		request.Params.Cursor,
-		prompts,
-	)
-	if err != nil {
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INVALID_PARAMS,
-			err:  err,
-		}
-	}
 	result := mcp.ListPromptsResult{
-		Prompts: promptsToReturn,
-		PaginatedResult: mcp.PaginatedResult{
-			NextCursor: nextCursor,
-		},
+		Prompts: prompts,
+	}
+	if request.Params.Cursor != "" {
+		result.NextCursor = "" // Handle pagination if needed
 	}
 	return &result, nil
 }
 
 func (s *MCPServer) handleGetPrompt(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.GetPromptRequest,
 ) (*mcp.GetPromptResult, *requestError) {
-	s.promptsMu.RLock()
+	s.mu.RLock()
 	handler, ok := s.promptHandlers[request.Params.Name]
-	s.promptsMu.RUnlock()
+	s.mu.RUnlock()
 
 	if !ok {
 		return nil, &requestError{
@@ -889,11 +666,10 @@ func (s *MCPServer) handleGetPrompt(
 
 func (s *MCPServer) handleListTools(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.ListToolsRequest,
 ) (*mcp.ListToolsResult, *requestError) {
-	// Get the base tools from the server
-	s.toolsMu.RLock()
+	s.mu.RLock()
 	tools := make([]mcp.Tool, 0, len(s.tools))
 
 	// Get all tool names for consistent ordering
@@ -909,102 +685,24 @@ func (s *MCPServer) handleListTools(
 	for _, name := range toolNames {
 		tools = append(tools, s.tools[name].Tool)
 	}
-	s.toolsMu.RUnlock()
-
-	// Check if there are session-specific tools
-	session := ClientSessionFromContext(ctx)
-	if session != nil {
-		if sessionWithTools, ok := session.(SessionWithTools); ok {
-			if sessionTools := sessionWithTools.GetSessionTools(); sessionTools != nil {
-				// Override or add session-specific tools
-				// We need to create a map first to merge the tools properly
-				toolMap := make(map[string]mcp.Tool)
-
-				// Add global tools first
-				for _, tool := range tools {
-					toolMap[tool.Name] = tool
-				}
-
-				// Then override with session-specific tools
-				for name, serverTool := range sessionTools {
-					toolMap[name] = serverTool.Tool
-				}
-
-				// Convert back to slice
-				tools = make([]mcp.Tool, 0, len(toolMap))
-				for _, tool := range toolMap {
-					tools = append(tools, tool)
-				}
-
-				// Sort again to maintain consistent ordering
-				sort.Slice(tools, func(i, j int) bool {
-					return tools[i].Name < tools[j].Name
-				})
-			}
-		}
-	}
-
-	// Apply tool filters if any are defined
-	s.toolFiltersMu.RLock()
-	if len(s.toolFilters) > 0 {
-		for _, filter := range s.toolFilters {
-			tools = filter(ctx, tools)
-		}
-	}
-	s.toolFiltersMu.RUnlock()
-
-	// Apply pagination
-	toolsToReturn, nextCursor, err := listByPagination(
-		ctx,
-		s,
-		request.Params.Cursor,
-		tools,
-	)
-	if err != nil {
-		return nil, &requestError{
-			id:   id,
-			code: mcp.INVALID_PARAMS,
-			err:  err,
-		}
-	}
+	s.mu.RUnlock()
 
 	result := mcp.ListToolsResult{
-		Tools: toolsToReturn,
-		PaginatedResult: mcp.PaginatedResult{
-			NextCursor: nextCursor,
-		},
+		Tools: tools,
+	}
+	if request.Params.Cursor != "" {
+		result.NextCursor = "" // Handle pagination if needed
 	}
 	return &result, nil
 }
-
 func (s *MCPServer) handleToolCall(
 	ctx context.Context,
-	id any,
+	id interface{},
 	request mcp.CallToolRequest,
 ) (*mcp.CallToolResult, *requestError) {
-	// First check session-specific tools
-	var tool ServerTool
-	var ok bool
-
-	session := ClientSessionFromContext(ctx)
-	if session != nil {
-		if sessionWithTools, typeAssertOk := session.(SessionWithTools); typeAssertOk {
-			if sessionTools := sessionWithTools.GetSessionTools(); sessionTools != nil {
-				var sessionOk bool
-				tool, sessionOk = sessionTools[request.Params.Name]
-				if sessionOk {
-					ok = true
-				}
-			}
-		}
-	}
-
-	// If not found in session tools, check global tools
-	if !ok {
-		s.toolsMu.RLock()
-		tool, ok = s.tools[request.Params.Name]
-		s.toolsMu.RUnlock()
-	}
+	s.mu.RLock()
+	tool, ok := s.tools[request.Params.Name]
+	s.mu.RUnlock()
 
 	if !ok {
 		return nil, &requestError{
@@ -1014,18 +712,7 @@ func (s *MCPServer) handleToolCall(
 		}
 	}
 
-	finalHandler := tool.Handler
-
-	s.middlewareMu.RLock()
-	mw := s.toolHandlerMiddlewares
-	s.middlewareMu.RUnlock()
-
-	// Apply middlewares in reverse order
-	for i := len(mw) - 1; i >= 0; i-- {
-		finalHandler = mw[i](finalHandler)
-	}
-
-	result, err := finalHandler(ctx, request)
+	result, err := tool.Handler(ctx, request)
 	if err != nil {
 		return nil, &requestError{
 			id:   id,
@@ -1041,9 +728,9 @@ func (s *MCPServer) handleNotification(
 	ctx context.Context,
 	notification mcp.JSONRPCNotification,
 ) mcp.JSONRPCMessage {
-	s.notificationHandlersMu.RLock()
+	s.mu.RLock()
 	handler, ok := s.notificationHandlers[notification.Method]
-	s.notificationHandlersMu.RUnlock()
+	s.mu.RUnlock()
 
 	if ok {
 		handler(ctx, notification)
@@ -1051,26 +738,26 @@ func (s *MCPServer) handleNotification(
 	return nil
 }
 
-func createResponse(id any, result any) mcp.JSONRPCMessage {
+func createResponse(id interface{}, result interface{}) mcp.JSONRPCMessage {
 	return mcp.JSONRPCResponse{
 		JSONRPC: mcp.JSONRPC_VERSION,
-		ID:      mcp.NewRequestId(id),
+		ID:      id,
 		Result:  result,
 	}
 }
 
 func createErrorResponse(
-	id any,
+	id interface{},
 	code int,
 	message string,
 ) mcp.JSONRPCMessage {
 	return mcp.JSONRPCError{
 		JSONRPC: mcp.JSONRPC_VERSION,
-		ID:      mcp.NewRequestId(id),
+		ID:      id,
 		Error: struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-			Data    any    `json:"data,omitempty"`
+			Code    int         `json:"code"`
+			Message string      `json:"message"`
+			Data    interface{} `json:"data,omitempty"`
 		}{
 			Code:    code,
 			Message: message,
