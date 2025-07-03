@@ -1,20 +1,20 @@
 package server
 
 import (
-	
+	"slices"
+
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"slices"
 )
 
 type Server struct {
-	server            *server.MCPServer
+	server *server.MCPServer
 }
 
 func NewSever() (*Server, error) {
 	s := &Server{
 		server: server.NewMCPServer(
-			"omc-mcp-server",
+			"mustgather-mcp-server",
 			"0.0.1",
 			server.WithResourceCapabilities(true, true),
 			server.WithPromptCapabilities(true),

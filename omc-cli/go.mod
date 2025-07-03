@@ -208,6 +208,9 @@ require (
 )
 
 replace github.com/metal3-io/baremetal-operator/pkg/hardwareutils => github.com/metal3-io/baremetal-operator/pkg/hardwareutils v0.0.0-20220216092208-3612e86973f1
+
 replace sigs.k8s.io/cluster-api-provider-aws => sigs.k8s.io/cluster-api-provider-aws v0.7.3
+
 replace sigs.k8s.io/cluster-api-provider-azure => sigs.k8s.io/cluster-api-provider-azure v1.20.1
+
 replace sigs.k8s.io/cluster-api => sigs.k8s.io/cluster-api v1.10.3

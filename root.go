@@ -30,6 +30,7 @@ OpenShift must-gather Model Context Protocol (MCP) server
   # start a SSE server on port 8080
   mustgather-mcp-server --sse-port 8080
 
+  # start a SSE server on port 8443 with a public HTTPS host of example.com
   mustgather-mcp-server --sse-port 8443 --sse-base-url https://example.com:8443`,
 
 	Run: func(cmd *cobra.Command, args []string) {
