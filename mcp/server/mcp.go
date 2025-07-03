@@ -16,6 +16,7 @@ func NewSever() (*Server, error) {
 		server: server.NewMCPServer(
 			"mustgather-mcp-server",
 			"0.0.1",
+			server.WithInstructions("kubectl like functionality but read only access to a openshift kubernetes cluster snapshot"),
 			server.WithResourceCapabilities(true, true),
 			server.WithPromptCapabilities(true),
 			server.WithToolCapabilities(true),
