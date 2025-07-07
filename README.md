@@ -1,103 +1,152 @@
-# `omc`: OpenShift Must-Gather Client
+# Must Gather MCP Server
 
-[![GitHub Actions Test Status](https://github.com/gmeghnag/omc/actions/workflows/test.yml/badge.svg)](https://github.com/gmeghnag/omc/actions?query=workflow%3ATest) [![GitHub Actions Build Status](https://github.com/gmeghnag/omc/actions/workflows/build.yml/badge.svg)](https://github.com/gmeghnag/omc/actions?query=workflow%3ABuild) ![Go version](https://img.shields.io/github/go-mod/go-version/gmeghnag/omc)
-![Downloads](https://img.shields.io/github/downloads/gmeghnag/omc/total) 
+An MCP (Model Context Protocol) server that provides a wrapper over `omc` commands to allow LLMs and MCP clients in analyzing any [OpenShift mustgather](https://github.com/openshift/must-gather) bundles. OMC is like a oc or kubectl cli tool that reads kubernetes objects, events and other resources like logs from a cluster mustgather. 
 
+## Features
 
+The server provides the following tools:
 
+### 1. mustgather_get
+Get Kubernetes resources using `omc get` command.
 
-`omc` tool has been created to allow engineers to inspect resources from a must-gather in the same way as they are retrieved with the `oc` command.
+**Parameters:**
+- `kind` (required): Resource type (pods, nodes, services, deployments, configmaps, secrets, namespaces, ingress, pvc, pv)
+- `all_namespaces` (optional): Get resources from all namespaces (-A flag)
+- `namespace` (optional): Specific namespace (-n flag)
+- `output` (optional): Output format (wide, yaml, json)
 
----
+### 2. mustgather_describe
+Describe pods or nodes using `omc describe` command.
+
+**Parameters:**
+- `kind` (required): Resource type (pods or nodes only)
+- `all_namespaces` (optional): Describe resources from all namespaces (-A flag)
+- `namespace` (optional): Specific namespace (-n flag)
+- `output` (optional): Output format (wide, yaml)
+
+### 3. mustgather_logs
+Get logs from a specific pod and container.
+
+**Parameters:**
+- `pod_name` (required): Name of the pod
+- `namespace` (required): Namespace of the pod
+- `container` (required): Container name within the pod
+
+### 4. mustgather_events
+Get cluster events using `omc events` command.
+
+**Parameters:**
+- `all_namespaces` (optional): Get events from all namespaces (-A flag)
+- `namespace` (optional): Specific namespace (-n flag)
+- `for` (optional): Filter events for a specific resource (--for flag)
+- `output` (optional): Output format (yaml, name)
+
+### 5. mustgather_node_logs
+Get node logs for a specific journalctl service.
+
+**Parameters:**
+- `service_name` (required): Journalctl service name
+
+### 6. mustgather_haproxy_backends
+Get HAProxy backends information.
+
+**Parameters:** None
+
+### 7. mustgather_etcd_health
+Check etcd cluster health.
+
+**Parameters:** None
+
+### 8. mustgather_etcd_status
+Get etcd cluster status.
+
+**Parameters:** None
+
+### 9. mustgather_projects
+List available projects (namespaces) in the OpenShift cluster.
+
+**Parameters:** None
+
+### 10. mustgather_use
+Switch to a different mustgather directory.
+
+**Parameters:**
+- `path` (required): Path to use for reading the mustgather bundle.
+
+## Prerequisites
+
+- go 1.23+
+- A mustgather bundle from any cluster
+
 ## Installation
 
-### Linux / OS X
-```
-# cd to a directory that is in your $PATH
+Clone or install the dependencies, build and run the MCP server.
 
-curl -sL https://github.com/gmeghnag/omc/releases/latest/download/omc_$(uname)_$(uname -m).tar.gz | tar xzf - omc && chmod +x ./omc
+```bash
+git clone https://github.com/shivprakashmuley/mustgather-mcp-server.git
+cd mustgather-mcp-server
 
-omc -h
-```
-**Note:** OS X may block the downloaded omc binary until it is approved via `System Settings` -> `Privacy & Security`.
+cd omc-cli
+go install . # Installs the omc cli to PATH (required)
 
-### Other Operating systems
-1. View the available downloads from the latest releases page
-1. Chose and download the Asset that best suits your operating system
-1. Un zip/tar the binary and move it to a directory location that is in your executable path. 
+cd ..
+go build -o mustgather-mcp-server
 
-### Build from source
-```
-$ git clone https://github.com/gmeghnag/omc.git
-$ cd omc/
-$ go install
+./mustgather-mcp-server # runs the MCP in stdio mode
 ```
 
-## Upgrade
-Starting with `v2.1.0` it's possible to upgrade the tool by running `omc upgrade --to=<version>`
+## Integrate with an MCP client
 
-## Usage
-Point it to a must-gather. This can be a local extracted must-gather, a local tarball, or a remote tarball:
+1. Claude desktop
+
+Set your `claude_desktop_config.json` as follows:
+
 ```
-$ omc use </path/to/must-gather/>
-```
-Use it like `oc`:
-```
-$ omc get clusterversion
-$ omc get pods -o wide -l app=etcd -n openshift-etcd
+{
+  "mcpServers": {
+    "mustgather": {
+      "command": "/path/to/mustgather-mcp-server",
+    }
+  }
+}
 ```
 
-### Examples
-- Retrieving master nodes by label:
+2. Goose
+
+Run `./mustgather-mcp-server --sse-port 8911` and set the following in your `~/.config/goose/config.yaml`.
+
 ```
-$ omc get node -l node-role.kubernetes.io/master= -o name   
-node/ip-10-0-132-49.eu-central-1.compute.internal
-node/ip-10-0-178-163.eu-central-1.compute.internal
-node/ip-10-0-202-187.eu-central-1.compute.internal
+extensions:
+  mustgather:
+    bundled: null
+    description: ''
+    enabled: false
+    env_keys: []
+    envs: {}
+    name: mustgather
+    timeout: 300
+    type: sse
+    uri: http://localhost:8911/sse
 ```
-- Retrieving etcd pod name from node name:
+
+3. Gemini CLI
+
+Set the following in your ~/.gemini/settings.json
+
 ```
-$ omc get pod -l app=etcd -o jsonpath="{.items[?(@.spec.nodeName=='ip-10-0-132-49.eu-central-1.compute.internal')].metadata.name}"
-etcd-ip-10-0-132-49.eu-central-1.compute.internal
+{
+  "mcpServers": {
+    "mustgather": {
+      "command": "/path/to/mustgather-mcp-server",
+      "cwd": "./",
+      "timeout": 900,
+      "trust": true
+    }
+  }
+}
 ```
-- Check the ETCD status:
-```
-$ omc etcd status
-+----------------------------+------------------+---------+----------------+----------+-----------+------------+-----------+------------+--------------------+--------+
-|          ENDPOINT          |        ID        | VERSION | DB SIZE/IN USE | NOT USED | IS LEADER | IS LEARNER | RAFT TERM | RAFT INDEX | RAFT APPLIED INDEX | ERRORS |
-+----------------------------+------------------+---------+----------------+----------+-----------+------------+-----------+------------+--------------------+--------+
-| https://10.44.134.165:2379 | 1763488a02d62c90 | 3.5.9   | 133 MB/90 MB   | 33%      | true      | false      |         7 |    2111896 |            2111896 |        |
-| https://10.44.135.227:2379 | 96e0b13f9c1287ea | 3.5.9   | 123 MB/90 MB   | 27%      | false     | false      |         7 |    2111896 |            2111896 |        |
-| https://10.44.135.186:2379 | bbdf013955819908 | 3.5.9   | 125 MB/90 MB   | 28%      | false     | false      |         7 |    2111896 |            2111896 |        |
-+----------------------------+------------------+---------+----------------+----------+-----------+------------+-----------+------------+--------------------+--------+
-```
-- Retrive the prometheus alerts in `firing` or `pending` state:
-```
-$ omc prom rules -s firing,pending -o wide
-GROUP                        RULE                                 STATE     AGE   ALERTS   ACTIVE SINCE
-cluster-version              UpdateAvailable                      firing    11s   1        27 Jan 22 14:32 UTC
-logging_fluentd.alerts       FluentdQueueLengthIncreasing         pending   27s   1        29 Jan 22 11:48 UTC
-general.rules                Watchdog                             firing    11s   1        25 Jan 22 08:50 UTC
-openshift-kubernetes.rules   AlertmanagerReceiversNotConfigured   firing    5s    1        25 Jan 22 08:51 UTC
-```
-- Retreive details of any certificate contained in configmaps/secrets/certificatesigningrequests:
-```
-$ omc certs inspect                                                                                                                   
-NAME                       KIND        AGE   CERTTYPE    SUBJECT                                             NOTBEFORE                       NOTAFTER                             
-kube-root-ca.crt           ConfigMap   47h   ca-bundle   CN=kube-apiserver-lb-signer,OU=openshift            2023-05-03 08:59:22 +0000 UTC 　2033-04-30 08:59:22 +0000 UTC
-kube-root-ca.crt           ConfigMap   47h   ca-bundle   CN=kube-apiserver-localhost-signer,OU=openshift     2023-05-03 08:59:22 +0000 UTC 　2033-04-30 08:59:22 +0000 UTC
-kube-root-ca.crt           ConfigMap   47h   ca-bundle   CN=*.apps.example.com                               2023-05-03 09:20:57 +0000 UTC 　2025-05-02 09:20:58 +0000 UTC
-kube-root-ca.crt           ConfigMap   47h   ca-bundle   CN=ingress-operator@1683105658                      2023-05-03 09:20:57 +0000 UTC 　2025-05-02 09:20:58 +0000 UTC
-openshift-service-ca.crt   ConfigMap   47h   ca-bundle   CN=openshift-service-serving-signer@1683105630      2023-05-03 09:20:29 +0000 UTC 　2025-07-01 09:20:30 +0000 UTC
-builder-token-9f5cx        Secret      47h   ca-bundle   CN=kube-apiserver-lb-signer,OU=openshift            2023-05-03 08:59:22 +0000 UTC 　2033-04-30 08:59:22 +0000 UTC
-builder-token-9f5cx        Secret      47h   ca-bundle   CN=*.apps.example.com                               2023-05-03 09:20:57 +0000 UTC 　2025-05-02 09:20:58 +0000 UTC
-builder-token-9f5cx        Secret      47h   ca-bundle   CN=ingress-operator@1683105658                      2023-05-03 09:20:57 +0000 UTC 　2025-05-02 09:20:58 +0000 UTC
-<...>
-```
-- Retreive HAProxy backends (of any namespace) from the ingresscontroller (HAProxy) config in the must-gather:
-```
-$ omc haproxy backends
-NAMESPACE       NAME                            INGRESSCONTROLLER    SERVICES                        PORT            TERMINATION
-testdata        rails-postgresql-example        default              rails-postgresql-example        web(8080)       http
-other-testdata  hello-node-secure               default              hello-node                      8080            edge/Redirect
-```
+
+## Demos
+
+1. https://asciinema.org/a/mvb4GGUfaAuUhMggBLrsmBBhe
+2. https://asciinema.org/a/xqbgtCi3QIqfAmioeTZNurJ0P
