@@ -3,16 +3,17 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-
-	//"net/http"
-	"os"
-	"os/exec"
-	//"strings"
 )
 
 const execTimeout = 2 * time.Minute
@@ -201,6 +202,17 @@ func (s *Server) initOMC() []server.ServerTool {
 			result, err := executeOMCCommand(cmdArgs)
 			return NewTextResult(result, err), nil
 		}},
+
+		// 11. download_must_gather
+		{mcp.NewTool("download_must_gather",
+			mcp.WithDescription("Download must-gather from a specific URL"),
+			mcp.WithString("url", mcp.Description("URL of the must-gather to download"), mcp.Required()),
+		), func(ctx context.Context, ctr mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			log.Printf("download_must_gather{}")
+
+			result, err := s.DownloadMustGather(ctx, ctr.Params.Arguments["url"].(string))
+			return NewTextResult(result, err), nil
+		}},
 	}
 }
 
@@ -223,81 +235,124 @@ func executeOMCCommand(args []string) (string, error) {
 }
 
 // DownloadMustGather implements the "download_must_gather" tool.
-func (s *Server) DownloadMustGather(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-
-	// get the url from the request
-	collectionURL := req.Params.Arguments["url"].(string)
-
-	//mustGatherURL, _ := utils.GetGatherFolderPath(prowJobURL.(string))
-	//mustGatherURL := "gs://test-platform-results/logs/periodic-ci-openshift-osde2e-main-nightly-4.18-osd-aws/1937008867888074752/artifacts/osd-aws/gather-must-gather/artifacts/must-gather.tar"
-	mustGatherURL := collectionURL + "/gather-must-gather/artifacts/must-gather.tar"
+func (s *Server) DownloadMustGather(ctx context.Context, mustGatherURL string) (string, error) {
+	// Create temporary directory for extraction
 	destDir, err := os.MkdirTemp("", "must-gather-extract-")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary directory: %w", err)
+		return "", fmt.Errorf("failed to create temporary directory: %w", err)
 	}
-	//defer os.RemoveAll(destDir) // Ensure temporary directory is removed on function exit
 
-	//auditURL := "gs://test-platform-results/logs/periodic-ci-openshift-osde2e-main-nightly-4.18-osd-aws/1937008867888074752/artifacts/osd-aws/gather-audit-logs/artifacts/audit-logs.tar"
-	auditURL := collectionURL + "/gather-audit-logs/artifacts/audit-logs.tar"
-	fullAuditDir := destDir + "/audit-logs.tar"
-	cmd := exec.Command("gsutil", "-m", "cp", auditURL, destDir)
+	fmt.Printf("Downloading must-gather from: %s\n", mustGatherURL)
 
-	err = cmd.Run()
+	// Check if URL contains inspect.local - if so, download directory contents directly
+	if strings.Contains(mustGatherURL, "inspect.local") {
+		fmt.Printf("Detected inspect.local URL - downloading directory contents directly\n")
+		
+		if err := downloadInspectLocal(mustGatherURL, destDir); err != nil {
+			return "", fmt.Errorf("failed to download inspect.local contents: %w", err)
+		}
+		
+		fmt.Printf("Successfully downloaded inspect.local contents to: %s\n", destDir)
+	} else {
+		// Standard tar file download and extraction
+		mustGatherDestPath := filepath.Join(destDir, "must-gather.tar")
+		if err := downloadFile(mustGatherURL, mustGatherDestPath); err != nil {
+			return "", fmt.Errorf("failed to download must-gather: %w", err)
+		}
+
+		fmt.Printf("Extracting must-gather from %s to: %s\n", mustGatherDestPath, destDir)
+		if err := extractTarFile(mustGatherDestPath, destDir); err != nil {
+			return "", fmt.Errorf("failed to extract must-gather: %w", err)
+		}
+	}
+
+	// Set omc to use the downloaded directory
+	cmd := exec.Command("omc", "use", destDir)
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("omc use command failed: %w", err)
+	}
+
+	fmt.Printf("Successfully set omc to use directory: %s\n", destDir)
+	return "Must-gather download and extraction successful.", nil
+}
+
+// downloadInspectLocal downloads inspect.local directory contents
+func downloadInspectLocal(url, destDir string) error {
+	if strings.HasPrefix(url, "gs://") {
+		// Use gsutil for Google Cloud Storage - recursive copy
+		cmd := exec.Command("gsutil", "-m", "cp", "-r", url, destDir)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("gsutil recursive cp command failed: %w", err)
+		}
+	} else {
+		// For HTTP URLs, we can't do recursive download easily
+		// This would require a more complex implementation or the user to provide a tar/zip
+		return fmt.Errorf("HTTP recursive directory download not supported for inspect.local - please provide gs:// URL")
+	}
+	return nil
+}
+
+// downloadFile downloads a file from either HTTP/HTTPS URL or GS bucket URL
+func downloadFile(url, destPath string) error {
+	if strings.HasPrefix(url, "gs://") {
+		// Use gsutil for Google Cloud Storage
+		cmd := exec.Command("gsutil", "-m", "cp", url, destPath)
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("gsutil cp command failed: %w", err)
+		}
+	} else if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+		// Use HTTP client for HTTP/HTTPS URLs
+		if err := downloadHTTPFile(url, destPath); err != nil {
+			return fmt.Errorf("HTTP download failed: %w", err)
+		}
+	} else {
+		return fmt.Errorf("unsupported URL scheme: %s", url)
+	}
+	return nil
+}
+
+// downloadHTTPFile downloads a file via HTTP/HTTPS
+func downloadHTTPFile(url, destPath string) error {
+	// Create the destination file
+	out, err := os.Create(destPath)
 	if err != nil {
-		// cmd.Run() returns an error if the command fails (non-zero exit code)
-		return nil, fmt.Errorf("gsutil cp command failed: %w", err)
+		return fmt.Errorf("failed to create destination file: %w", err)
 	}
-	fmt.Println("Download successful. Starting extraction and analysis...")
+	defer out.Close()
 
-	fmt.Printf("Extracting contents from %s to: %s \n", fullAuditDir, destDir)
-	cmd = exec.Command("tar", "-xvf", fullAuditDir, "-C", destDir)
-	err = cmd.Run()
+	// Create HTTP client with timeout
+	client := &http.Client{
+		Timeout: 10 * time.Minute, // Allow for large file downloads
+	}
+
+	// Get the data
+	resp, err := client.Get(url)
 	if err != nil {
-		// cmd.Run() returns an error if the command fails (non-zero exit code)
-		return nil, fmt.Errorf("tar command failed: %w", err)
+		return fmt.Errorf("failed to download file: %w", err)
 	}
-	// 1. Download the must-gather.tar.gz file using an HTTP GET request.
-	fmt.Printf("MustGatherURL: %s \n", mustGatherURL)
-	fullDir := destDir + "/must-gather.tar"
+	defer resp.Body.Close()
 
-	cmd = exec.Command("gsutil", "-m", "cp", mustGatherURL, destDir)
+	// Check server response
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
 
-	err = cmd.Run()
+	// Copy the body to file
+	_, err = io.Copy(out, resp.Body)
 	if err != nil {
-		// cmd.Run() returns an error if the command fails (non-zero exit code)
-		return nil, fmt.Errorf("gsutil cp command failed: %w", err)
+		return fmt.Errorf("failed to save file: %w", err)
 	}
 
-	cmd = exec.Command("tar", "-xvf", fullDir, "-C", destDir)
-	err = cmd.Run()
-	if err != nil {
-		// cmd.Run() returns an error if the command fails (non-zero exit code)
-		return nil, fmt.Errorf("tar command failed: %w", err)
-	}
+	return nil
+}
 
-	// collect inspect.local
-	//inspectLocalURL := "gs://test-platform-results/logs/periodic-ci-openshift-release-master-nightly-4.20-e2e-aws-ovn-single-node-techpreview-serial/1939310646927560704/artifacts/e2e-aws-ovn-single-node-techpreview-serial/gather-must-gather/artifacts/must-gather/inspect.local.4821810590815119360/"
-	//inspectLocalURL := mustGatherURL
-	/*cmd := exec.Command("gsutil", "-m", "cp", "-r", mustGatherURL, destDir)
-
-	err = cmd.Run()
-	if err != nil {
-		// cmd.Run() returns an error if the command fails (non-zero exit code)
-		return nil, fmt.Errorf("gsutil cp command failed: %w", err)
+// extractTarFile extracts a tar file to a destination directory
+func extractTarFile(tarPath, destDir string) error {
+	cmd := exec.Command("tar", "-xf", tarPath, "-C", destDir)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("tar extraction failed: %w", err)
 	}
-	fmt.Println("Extraction successful.")
-	*/
-	// set "omc use" to destDir
-	//cmd := exec.Command("omc", "use", "gs://test-platform-results/logs/periodic-ci-openshift-release-master-okd-scos-4.20-upgrade-from-okd-scos-4.19-e2e-aws-ovn-upgrade/1937465859354136576/artifacts/e2e-aws-ovn-upgrade/gather-must-gather/artifacts/must-gather")
-	cmd = exec.Command("omc", "use", destDir)
-	err = cmd.Run()
-	if err != nil {
-		// cmd.Run() returns an error if the command fails (non-zero exit code)
-		return nil, fmt.Errorf("omc use command failed: %w", err)
-	}
-	fmt.Println("omc use command successful.", destDir)
-	//return nil, err
-	return NewTextResult("Extraction successful.", err), nil
+	return nil
 }
 
 // AnalyzeMustGather implements the "analyze_must_gather" tool.
